@@ -57,3 +57,61 @@ La H200 comparte el chip de la H100 y cambia la memoria por HBM3e, por lo que su
 **Quién lidera en eficiencia.** Aquí cambia el orden. Las consultas por segundo por vatio fueron 95,76 para el sistema H200 y 314,30 para el de Untether, unas 3,3 veces más para la NPU (314,30 / 95,76 = 3,28). La razón es de diseño: la NPU de Untether usa computación en memoria (*at-memory compute*) y tarjetas de 75 W, mientras que una H200 SXM está pensada para consumir hasta 700 W y maximizar las cargas grandes de LLM. La NPU renuncia a flexibilidad (solo reportó ResNet-50) y gana en vatios. Esto coincide con la lectura de xpu.pub (2024): entre el 60 % y el 65 % del rendimiento con cerca del 20 % de la potencia.
 
 La conclusión es que "mejor" depende de la métrica. Para un centro de datos que necesita cubrir muchos modelos, la GPU es la elección natural por su cobertura; para un nodo con presupuesto térmico fijo y un solo modelo de visión, una NPU o una FPGA bien diseñada puede ser más sensata.
+
+## 3. Costos, TDP y TCO a 3 años
+
+Se compararon dos escenarios. En todos los cálculos se usan 26.280 horas (3 años × 8.760 h), operación continua y una tarifa eléctrica industrial de 8,91 centavos por kWh, que es el promedio de EIA de los 12 meses hasta julio de 2026 según Start Business by State (2026). No se incluyen refrigeración (PUE), servidor anfitrión, red ni personal, por lo que son costos mínimos de referencia.
+
+### Escenario 1: startup en la nube con menos de 100 solicitudes por segundo
+
+Una startup con ese volumen no compra hardware: alquila. Los precios por hora son un rango de mercado y varían mucho entre proveedores.
+
+**Tabla 3. Costo de alquilar un acelerador 24/7 durante 3 años**
+
+| Opción | Tarifa por hora | Cálculo | Total 3 años |
+|---|---|---|---|
+| H100 en proveedor económico | 2,50 USD | 2,50 × 26.280 | 65.700 USD |
+| H100 en el rango alto citado | 3,50 USD | 3,50 × 26.280 | 91.980 USD |
+| TPU v5e (precio de lista us-west1) | 1,20 USD | 1,20 × 26.280 | 31.536 USD |
+
+La H100 se cotiza entre 2,50 USD por hora en un proveedor económico (GPUPerHour, s. f.) y entre 2,75 y 3,50 USD en otro análisis de mercado (Cyfuture, 2026). El precio de lista de la TPU v5e es de 1,20 USD por chip-hora (iThome, 2023). A 100 solicitudes por segundo, una sola H100 queda casi ociosa: si cada solicitud fuera una inferencia tipo ResNet-50, el sistema H200 de 8 GPU atendió 480.131 consultas/s, o sea unas 60.000 por GPU. Eso significa que la startup estaría usando menos del 0,2 % de la capacidad. Para ella conviene un acelerador pequeño, instancias bajo demanda con apagado automático, o la TPU v5e si su modelo corre en JAX o TensorFlow, porque el costo base es menos de la mitad.
+
+### Escenario 2: borde, un nodo con el modelo en el dispositivo
+
+En el borde el capital y la energía pesan más que el costo por hora. Solo se calcula la energía a TDP máximo, porque es la parte que se puede sustentar con fuentes.
+
+**Tabla 4. Energía de un nodo continuo durante 3 años (8,91 ¢/kWh)**
+
+| Dispositivo | Potencia | Energía (kWh) | Costo de energía |
+|---|---|---|---|
+| NVIDIA T4 | 70 W | 1.839,6 | 163,90 USD |
+| AMD Alveo U55C | 150 W (máx.) | 3.942,0 | 351,22 USD |
+| NVIDIA H100 SXM | 700 W | 18.396,0 | 1.639,08 USD |
+
+Sobre el capital, el único precio verificado es el de la H100: entre 25.000 y 30.000 USD en versión PCIe y entre 35.000 y 40.000 USD en SXM (Fluence, 2026), con un rango general de 30.000 a más de 40.000 USD según otra fuente (GMI Cloud, 2026). No se consiguió un precio fiable y citable para la T4 ni para la U55C, por lo que no se inventó uno. El resultado útil es relativo: en 3 años la energía de una H100 (unos 1.639 USD) es pequeña frente a su precio de compra, así que en el borde el argumento contra la H100 no es la factura eléctrica, sino que 700 W exigen refrigeración y fuente que un gabinete industrial normalmente no tiene.
+
+## 4. Recomendación por perfil
+
+### Perfil A: laboratorio universitario con 10.000 USD, visión y NLP hasta 7B
+
+Un modelo de 7.000 millones de parámetros ocupa unos 14 GB en FP16 y unos 7 GB en INT8, solo en pesos, sin contar la caché de atención ni las activaciones. Criterios técnicos:
+
+1. **Capacidad de memoria.** Una GPU de 16 GB como la T4 queda justa en FP16, y una de 24 GB o más da margen para contexto y lotes.
+2. **Ecosistema de software.** CUDA, PyTorch y TensorRT cubren visión y NLP con la menor fricción para estudiantes.
+3. **Presupuesto.** Una H100 de 25.000 a 30.000 USD (Fluence, 2026) supera el presupuesto, y una FPGA exige tiempo de desarrollo que un laboratorio docente no tiene.
+
+La recomendación es una estación con una o dos GPU de consumo o de estación de trabajo con al menos 24 GB, y usar créditos de nube para los picos: con 2,50 USD por hora, 10.000 USD equivalen a 4.000 horas de H100 (10.000 / 2,50). Limitaciones: sin NVLink no se pueden repartir bien modelos grandes, y el ajuste fino de 7B completo no cabe, por lo que habría que usar LoRA o cuantización. No se cotizó una GPU concreta por falta de una fuente de precio verificable.
+
+### Perfil B: inspección en manufactura, menos de 5 ms por imagen, 50 líneas
+
+Aquí manda la latencia determinista. La recomendación para este perfil se discute en detalle en la Decisión 3. En resumen, se elige una GPU central H100 si las cámaras ya están en red y el jitter de red se controla, y FPGA distribuida solo si el requisito de determinismo por línea es estricto. Criterios: latencia máxima y jitter, tolerancia a fallos, costo de capital y facilidad de mantener el modelo.
+
+### Perfil C: entrenamiento en la nube de un modelo de 70B en 512 aceleradores
+
+Los pesos de 70.000 millones de parámetros en bf16 ocupan 140 GB, y con estado del optimizador el entrenamiento necesita más de un terabyte repartido, por lo que lo que manda es la red entre chips. Criterios:
+
+1. **Interconexión.** El NVLink de la H100 da 900 GB/s por GPU dentro del nodo (NVIDIA, s. f.); la TPU v4 escala a 4.096 chips con conmutadores ópticos (Jouppi et al., 2023); un pod de TPU v5e tiene 256 chips y 1,6 TB/s de ancho de banda de bisección (Google Cloud, s. f.).
+2. **Escala.** 512 chips superan un pod de v5e, por lo que habría que cruzar la red del centro de datos y perder eficiencia.
+3. **Ecosistema.** Si el equipo ya usa PyTorch, un clúster de H100 con NVLink e InfiniBand evita reescribir el código; si usa JAX, una TPU v4 es una opción real.
+
+Limitaciones: la disponibilidad de H100 y su precio por hora varían mucho (de 1,38 a 11,68 USD según DeployBase, 2026), y las TPU solo se alquilan en Google Cloud, lo que genera dependencia de un proveedor.
