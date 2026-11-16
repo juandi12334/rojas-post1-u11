@@ -115,3 +115,90 @@ Los pesos de 70.000 millones de parámetros en bf16 ocupan 140 GB, y con estado 
 3. **Ecosistema.** Si el equipo ya usa PyTorch, un clúster de H100 con NVLink e InfiniBand evita reescribir el código; si usa JAX, una TPU v4 es una opción real.
 
 Limitaciones: la disponibilidad de H100 y su precio por hora varían mucho (de 1,38 a 11,68 USD según DeployBase, 2026), y las TPU solo se alquilan en Google Cloud, lo que genera dependencia de un proveedor.
+
+## 5. Cuantización INT8 frente a FP32
+
+La cuantización reemplaza números de 32 bits por enteros de 8 bits. En hardware sirve por dos razones: se mueve la cuarta parte de los bytes (lo que importa porque la inferencia suele estar limitada por memoria, como se vio con el vectorAdd) y las unidades INT8 duplican el pico. La T4 pasa de 65 TFLOPS FP16 a 130 TOPS INT8 (NVIDIA, 2018), y la H100 pasa de 989 a 1.979 en valores densos (SemiAnalysis, s. f.).
+
+Pero la cuantización no es gratis. Wu et al. (2020) midieron la cuantización posterior al entrenamiento (PTQ) con distintos métodos de calibración. La calibración es obligatoria porque hay que decidir el rango de cada tensor, y un rango mal elegido destruye la precisión.
+
+**Tabla 5. FP32 frente a INT8 (PTQ), Wu et al. (2020)**
+
+| Modelo | FP32 | INT8 | Relación INT8/FP32 | ¿Cumple 99 %? | ¿Cumple 99,9 %? |
+|---|---|---|---|---|---|
+| ResNet-50 (top-1 %) | 76,16 | 75,68 (peor calibración) | 99,37 % | Sí | No |
+| ResNet-50 (top-1 %) | 76,16 | 76,05 (mejor calibración) | 99,86 % | Sí | No |
+| BERT-Large (F1, SQuAD) | 91,01 | 85,92 (calibración máx.) | 94,41 % | No | No |
+| BERT-Large (F1, SQuAD) | 91,01 | 37,40 (entropía) | 41,09 % | No | No |
+| BERT-Large (F1, SQuAD) | 91,01 | 89,59 (percentil 99,99) | 98,44 % | No | No |
+| BERT-Large (F1, SQuAD) | 91,01 | 90,20 (percentil 99,999) | 99,11 % | Sí | No |
+
+Los porcentajes se calcularon dividiendo los valores de la tabla (por ejemplo, 75,68 / 76,16 = 0,9937). Los umbrales son los pisos de precisión de MLPerf: el 99 % y el 99,9 % del resultado FP32 de referencia (Reddi et al., 2020).
+
+El contraste entre los dos modelos es la lección principal. ResNet-50 sobrevive a cualquier calibración razonable, pero BERT-Large con calibración por entropía cae de 91,01 a 37,40, un modelo inservible. Las activaciones de un transformer tienen valores atípicos grandes, y un método de calibración que los recorta mal arruina la salida. Por eso en MLPerf las presentaciones de BERT se miden con dos pisos de precisión (99 % y 99,9 %) y la cuantización se valida contra ellos.
+
+## Decisiones de diseño de la Parte 2
+
+### Decisión 3: GPU H100 centralizada frente a FPGA distribuida para el Perfil B
+
+Para inspeccionar 50 líneas con menos de 5 ms por imagen y unas 500 imágenes por segundo en total, se eligió como primera opción una GPU H100 centralizada, con una salvedad. El argumento es de capacidad y de costo: la H100 cuesta cerca de 30.000 USD por unidad (GMI Cloud, 2026), mientras que la alternativa distribuida con una FPGA por línea que plantea la guía de la actividad ronda los 400.000 USD. Además, el rendimiento sobra: si cada GPU del sistema de referencia da unas 60.000 consultas/s en ResNet-50 (cálculo propio a partir de IEEE Spectrum, 2024), 500 imágenes por segundo son menos del 1 % de la capacidad, así que hay mucho margen para un modelo más pesado. La GPU también permite actualizar el modelo en un solo lugar.
+
+La salvedad es el punto único de falla: si la H100 falla o la red cae, se detienen las 50 líneas. Se mitigaría con una segunda GPU en reserva activa, que aun así costaría una fracción de la solución FPGA. También hay que medir el jitter: en la Parte 1 se vio que el tiempo total depende más de las copias que del cálculo, y en una red industrial la latencia de transporte puede acercarse al límite de 5 ms. Si las pruebas muestran que el jitter supera el presupuesto, o si un paro de línea tiene implicaciones de seguridad, la FPGA por línea justifica su costo porque ofrece latencia determinista y fallas aisladas.
+
+### Decisión 4: ¿cuantizar a INT8 el modelo del Perfil B?
+
+Se decidió cuantizar a INT8, pero solo después de validar la precisión por clase y no con la métrica agregada. La razón a favor es el margen: INT8 duplica el pico de cómputo (de 989 a 1.979 TOPS en la H100) y reduce a un cuarto el tráfico de memoria, lo que da holgura para el límite de 5 ms. Como el modelo de inspección probablemente se parezca a ResNet-50, la Tabla 5 indica que la caída en top-1 es pequeña, entre 0,1 y 0,5 puntos.
+
+El riesgo es distinto del que mide el top-1. Un modelo de inspección busca defectos, y los defectos son la clase rara. El top-1 agregado puede mantenerse en 99,4 % mientras el recall de la clase "defecto" cae varios puntos, y eso significa piezas defectuosas que pasan sin detectarse, o falsos negativos. Por eso, antes de desplegar, se calibraría con imágenes reales de la línea (incluyendo defectos), se compararía el recall por clase contra FP32 y se fijaría un criterio de aceptación, por ejemplo no perder más de un punto de recall en defectos. Si no se cumple, se usaría cuantización con entrenamiento (QAT) o se mantendría FP16 en las capas más sensibles. Es un caso donde la ganancia de velocidad no justifica por sí sola el riesgo de dejar pasar un defecto.
+
+## Conclusiones
+
+No existe un acelerador mejor en términos absolutos. La GPU lidera en versatilidad y throughput total, como lo mostró el sistema H200 en todas las cargas de MLPerf v4.1. La NPU de Untether ganó en eficiencia energética, con 314,30 consultas por segundo por vatio frente a 95,76. La TPU ofrece el precio por hora más bajo para cargas que encajan con su software (1,20 USD frente a 2,50 USD o más de la H100) y escala bien en entrenamiento. La FPGA tiene sentido cuando la latencia determinista pesa más que el costo de desarrollo.
+
+Las mediciones propias en la T4 refuerzan una idea que atraviesa todo el análisis: el cómputo suele ser barato y el movimiento de datos es lo caro. El kernel de vectorAdd tardó 0,77 ms mientras que con las copias llegó a 74,10 ms, y solapar transferencia y cómputo con streams redujo el tiempo en un 24 %. A escala de centro de datos es lo mismo que explica por qué la memoria HBM, el NVLink y la cuantización importan tanto como los TFLOPS de la hoja de datos.
+
+Como limitaciones del estudio, los costos de energía son mínimos porque no incluyen refrigeración ni el servidor, el valor por GPU de MLPerf es un cálculo propio, no hubo resultados de FPGA en la ronda consultada y no se pudo verificar el precio de la T4 y la U55C. Las decisiones del Perfil B dependen de datos que habría que medir en planta: jitter de red y recall por clase.
+
+## Referencias
+
+Advanced Micro Devices. (2023). *Alveo U55C data center accelerator cards data sheet* (DS978, v1.3). https://docs.amd.com/r/en-US/ds978-u55c/Summary
+
+AnandTech. (2023). *Apple announces M3 SoC family: M3, M3 Pro, and M3 Max make their marks*. https://www.anandtech.com/show/21116/apple-announces-m3-soc-family-m3-m3-pro-and-m3-max-make-their-marks
+
+Apple. (2023, 30 de octubre). *Apple unveils M3, M3 Pro, and M3 Max, the most advanced chips for a personal computer* [Comunicado de prensa]. https://www.apple.com/newsroom/2023/10/apple-unveils-m3-m3-pro-and-m3-max-the-most-advanced-chips-for-a-personal-computer/
+
+Cyfuture. (2026). *H100 GPU price trends and future expectations*. https://cyfuture.cloud/kb/gpu/h100-gpu-price-trends-and-future-expectations
+
+DeployBase. (2026). *NVIDIA H100 price*. https://deploybase.ai/articles/nvidia-h100-price
+
+Fluence. (2026). *NVIDIA H100 deep dive: Specs, pricing, best uses, and where to run it*. https://www.fluence.network/blog/nvidia-h100-deep-dive/
+
+GMI Cloud. (2026). *NVIDIA H100 GPU pricing 2026: Rent vs buy cost analysis*. https://www.gmicloud.ai/blog/nvidia-h100-gpu-pricing-2026-rent-vs-buy-cost-analysis
+
+Google Cloud. (s. f.). *Cloud TPU v5e*. Documentación de Cloud TPU. https://cloud.google.com/tpu/docs/v5e
+
+GPUPerHour. (s. f.). *NVIDIA H100 price*. https://gpuperhour.com/blog/nvidia-h100-price
+
+iThome. (2023). *Google Cloud TPU v5e* [Reseña]. https://www.ithome.com.tw/review/162164
+
+IEEE Spectrum. (2024). *AI inference competition heats up: First MLPerf benchmarks for Nvidia Blackwell, AMD, Google, Untether AI*. https://spectrum.ieee.org/new-inference-chips
+
+Jouppi, N. P., Kurian, G., Li, S., Ma, P., Nagarajan, R., Nai, L., Patil, N., Subramanian, S., Swing, A., Towles, B., Young, C., Zhou, X., Zhou, Z., & Patterson, D. (2023). TPU v4: An optically reconfigurable supercomputer for machine learning with hardware support for embeddings. En *Proceedings of the 50th Annual International Symposium on Computer Architecture (ISCA '23)*. ACM. https://doi.org/10.1145/3579371.3589350
+
+NVIDIA. (2018). *NVIDIA T4 Tensor Core GPU datasheet*. https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/tesla-t4/t4-tensor-core-datasheet.pdf
+
+NVIDIA. (s. f.). *NVIDIA H100 Tensor Core GPU datasheet*. https://www.nvidia.com/en-us/data-center/h100/
+
+NVIDIA. (2024, 28 de agosto). *NVIDIA Blackwell platform sets new LLM inference records in MLPerf Inference v4.1*. NVIDIA Technical Blog. https://developer.nvidia.com/blog/nvidia-blackwell-platform-sets-new-llm-inference-records-in-mlperf-inference-v4-1
+
+Qualcomm. (2023). *Snapdragon 8 Gen 3 mobile platform*. https://www.qualcomm.com/smartphones/products/8-series/snapdragon-8-gen-3-mobile-platform
+
+Reddi, V. J., Cheng, C., Kanter, D., Mattson, P., Schmuelling, G., Wu, C.-J., Anderson, B., Breughe, M., Charlebois, M., Chou, W., Chukka, R., Coleman, C., Davis, S., Deng, P., Diamos, G., Duke, J., Fick, D., Gardner, J. S., Hubara, I., … Zhou, Y. (2020). MLPerf inference benchmark. En *2020 ACM/IEEE 47th Annual International Symposium on Computer Architecture (ISCA)* (pp. 446-459). IEEE. https://doi.org/10.1109/ISCA45697.2020.00045
+
+SemiAnalysis. (s. f.). *NVIDIA H100 SXM*. InferenceX. https://inferencex.semianalysis.com/chips/h100
+
+Start Business by State. (2026, 28 de septiembre). *Business electricity prices by state* [Datos de la U.S. Energy Information Administration]. https://startbusinessbystate.com/?p=16487
+
+Wu, H., Judd, P., Zhang, X., Isaev, M., & Micikevicius, P. (2020). *Integer quantization for deep learning inference: Principles and empirical evaluation*. arXiv. https://arxiv.org/abs/2004.09602
+
+xpu.pub. (2024, 20 de septiembre). *MLPerf reveals Blackwell gains, Untether's power efficiency*. https://xpu.pub/2024/09/20/mlperf-4-1/
